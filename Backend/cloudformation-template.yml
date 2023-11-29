@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CloudFormation template for database, S3, scraper, and app setup"
+
+Parameters:
+  DBName:
+    Type: String
+    Description: "Database name"
+  DBUsername:
+    Type: String
+    Description: "Database username"
+  DBPassword:
+    Type: String
+    Description: "Database password"
+  ImageBucketName:
+    Type: String
+    Description: "S3 bucket name for images"
+  AppName:
+    Type: String
+    Description: "Elastic Beanstalk application name"
+  EnvironmentName:
+    Type: String
+    Description: "Elastic Beanstalk environment name"
+  InstanceType:
+    Type: String
+    Default: "t2.micro"
+    Description: "EC2 instance type for Elastic Beanstalk"
+
+Resources:
+  MyDBInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AllocatedStorage: 5
+      DBInstanceIdentifier: "MyDBInstance"
+      DBName: !Ref DBName
+      Engine: "mysql"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      BackupRetentionPeriod: 7
+
+  ImageBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref ImageBucketName
+
+  ImageUploadLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.handler"
+      Role: !GetAtt ImageUploadLambdaRole.Arn
+      FunctionName: "ImageUploadLambda"
+      Timeout: 60
+      Runtime: "nodejs14.x"
+      Code:
+        S3Bucket: !Ref AWS::AccountId
+        S3Key: "lambda-code/image-upload-lambda.zip"
+      Environment:
+        Variables:
+          ImageBucketName: !Ref ImageBucket
+      Events:
+        ImageUploadTrigger:
+          Type: "S3"
+          Properties:
+            Bucket: !Ref ImageBucket
+            Events: "s3:ObjectCreated:*"
+
+  ImageUploadLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "ImageUploadLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${ImageBucket}/*"
+
+  ScraperLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "scraper.handler"
+      Role: !GetAtt ScraperLambdaRole.Arn
+      FunctionName: "ScraperLambda"
+      Timeout: 300
+      Runtime: "nodejs14.x"
+      Code:
+        S3Bucket: !Ref AWS::AccountId
+        S3Key: "lambda-code/scraper-lambda.zip"
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt MyDBInstance.Endpoint.Address
+          DB_USER: !Ref DBUsername
+          DB_PASSWORD: !Ref DBPassword
+          DB_DATABASE: !Ref DBName
+
+  ScraperLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "ScraperLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "rds-db:connect"
+                Resource: !Sub "arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:MyDBInstance/${DBUsername}"
+
+  ScheduledScraperJob:
+    Type: "AWS::Events::Rule"
+    Properties:
+      ScheduleExpression: "cron(0 * * * ? *)"  # Run every hour
+      Targets:
+        - Arn: !GetAtt ScraperLambda.Arn
+          Id: "ScraperJob"
+
+  ScraperLambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ScraperLambda
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledScraperJob.Arn
+
+  ElasticBeanstalkApplication:
+    Type: "AWS::ElasticBeanstalk::Application"
+    Properties:
+      ApplicationName: !Ref AppName
+
+  ElasticBeanstalkEnvironment:
+    Type: "AWS::ElasticBeanstalk::Environment"
+    Properties:
+      ApplicationName: !Ref AppName
+      EnvironmentName: !Ref EnvironmentName
+      SolutionStackName: "64bit Amazon Linux 2 v5.4.0 running Node.js 14"
+      OptionSettings:
+        - Namespace: "aws:autoscaling:launchconfiguration"
+          OptionName: "InstanceType"
+          Value: !Ref InstanceType
+        - Namespace: "aws:ec2:instances"
+          OptionName: "MinSize"
+          Value: "1"
+        - Namespace: "aws:ec2:instances"
+          OptionName: "MaxSize"
+          Value: "1"
